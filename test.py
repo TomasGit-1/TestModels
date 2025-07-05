@@ -1,97 +1,76 @@
+import tensorflow as tf
 import pandas as pd
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.applications import InceptionV3, ResNet50, DenseNet121
-from tensorflow.keras.applications.inception_v3 import preprocess_input as preprocess_incep
-from tensorflow.keras.applications.resnet import preprocess_input as preprocess_resnet
-from tensorflow.keras.applications.densenet import preprocess_input as preprocess_dense
-from tensorflow.keras.layers import LSTM, GRU, Dense
-from tensorflow.keras.models import Sequential
+
+from tensorflow.keras.applications import InceptionV3, ResNet50, DenseNet121, VGG16
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Input
 from tensorflow.keras.utils import to_categorical
-from sklearn.model_selection import train_test_split
-import time
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.models import Model
+from tensorflow.image import resize
 
-# ---------------------- CONFIGURACIÓN ----------------------
-N_FRAMES = 4         # Frames por secuencia
-EPOCHS = 5
-BATCH_SIZE = 32
+# Cargar CSV
+train_df = pd.read_csv('datasets/sign_mnist_train.csv')
+test_df = pd.read_csv('datasets/sign_mnist_test.csv')
 
-# ---------------------- MODELOS CNN + RNN ----------------------
-models_cnn = {
-    'InceptionV3': (InceptionV3, preprocess_incep),
-    'ResNet50': (ResNet50, preprocess_resnet),
-    'DenseNet121': (DenseNet121, preprocess_dense)
-}
+# Separar labels y pixeles
+y_train = train_df['label'].values
+X_train = train_df.drop('label', axis=1).values
 
-models_rnn = ['LSTM', 'GRU']
+y_test = test_df['label'].values
+X_test = test_df.drop('label', axis=1).values
 
-# ---------------------- CARGA Y FORMATO ----------------------
-df = pd.read_csv('datasets/sign_mnist_train.csv')
-X = df.drop('label', axis=1).values.reshape(-1, 28, 28, 1).astype('float32') / 255.
-y = to_categorical(df['label'])
-num_classes = y.shape[1]
+# Normalizar pixeles y convertir a imágenes 28x28
+X_train = X_train / 255.0
+X_test = X_test / 255.0
 
-# Crear secuencias
-total_samples = len(X) // N_FRAMES
-X = X[:total_samples * N_FRAMES]
-y = y[:total_samples * N_FRAMES:N_FRAMES]
-X_seq = X.reshape((total_samples, N_FRAMES, 28, 28, 1))
+X_train = X_train.reshape(-1, 28, 28, 1)
+X_test = X_test.reshape(-1, 28, 28, 1)
 
-# ---------------------- PREPROCESAMIENTO RGB ----------------------
-def preprocess_sequence(seq, target_size=(224, 224)):
-    rgb_seq = []
-    for frame in seq:
-        resized = tf.image.resize_with_pad(frame, target_size[0], target_size[1])
-        rgb = tf.image.grayscale_to_rgb(resized)
-        rgb_seq.append(rgb)
-    return np.array(rgb_seq)
+# Expandir a 3 canales (RGB)
+X_train = np.repeat(X_train, 3, axis=-1)
+X_test = np.repeat(X_test, 3, axis=-1)
 
-# Preprocesar todas las secuencias
-X_seq_rgb = np.array([preprocess_sequence(seq) for seq in X_seq])
+# Convertir etiquetas a one-hot
+num_classes = np.max(y_train) + 1
+y_train_cat = to_categorical(y_train, num_classes)
+y_test_cat = to_categorical(y_test, num_classes)
 
-# ---------------------- RESULTADOS ----------------------
-results = []
 
-for cnn_name, (cnn_class, preprocess_fn) in models_cnn.items():
-    print(f"\n📦 Extrayendo embeddings con {cnn_name}...")
-    base_model = cnn_class(weights='imagenet', include_top=False, pooling='avg', input_shape=(224, 224, 3))
+def resize_images(images, size):
+    images_resized = tf.image.resize(images, size)
+    return images_resized.numpy()
 
-    # Extraer embeddings (N_videos, N_FRAMES, D)
-    X_embeddings = []
-    for video in X_seq_rgb:
-        frames = preprocess_fn(video)
-        feats = base_model.predict(frames, verbose=0)
-        X_embeddings.append(feats)
-    X_embeddings = np.array(X_embeddings)
+# Tamaño para los modelos (por ejemplo, 224x224)
+img_size = 224
 
-    for rnn_type in models_rnn:
-        print(f"\n🚀 Entrenando {cnn_name} + {rnn_type}...")
-        X_train, X_val, y_train, y_val = train_test_split(X_embeddings, y, test_size=0.2)
+X_train_resized = resize_images(X_train, (img_size, img_size))
+X_test_resized = resize_images(X_test, (img_size, img_size))
 
-        model = Sequential()
-        if rnn_type == 'LSTM':
-            model.add(LSTM(128, input_shape=(N_FRAMES, X_embeddings.shape[-1])))
-        else:
-            model.add(GRU(128, input_shape=(N_FRAMES, X_embeddings.shape[-1])))
-        model.add(Dense(num_classes, activation='softmax'))
 
-        model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+def build_model(base_model_class, input_shape=(img_size, img_size, 3), num_classes=num_classes):
+    base_model = base_model_class(weights='imagenet', include_top=False, input_tensor=Input(shape=input_shape))
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(256, activation='relu')(x)
+    predictions = Dense(num_classes, activation='softmax')(x)
+    model = Model(inputs=base_model.input, outputs=predictions)
+    
+    # Congelar pesos del base_model para transferencia
+    for layer in base_model.layers:
+        layer.trainable = False
 
-        start_time = time.time()
-        history = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0)
-        elapsed = time.time() - start_time
+    model.compile(optimizer=Adam(learning_rate=1e-4), loss='categorical_crossentropy', metrics=['accuracy'])
+    return model
 
-        final_acc = history.history['val_accuracy'][-1]
-        results.append({
-            'Modelo': f'{cnn_name}+{rnn_type}',
-            'Accuracy': round(final_acc, 4),
-            'Tiempo(s)': round(elapsed, 1),
-            'Parámetros': model.count_params()
-        })
-        print(f"✅ {cnn_name}+{rnn_type} - Acc: {final_acc:.4f} - Tiempo: {elapsed:.1f}s - Paráms: {model.count_params()}")
 
-# ---------------------- MOSTRAR RESULTADOS ----------------------
-print("\n📊 Resultados resumen:")
-print(f"{'Modelo':<25}{'Accuracy':<10}{'Tiempo(s)':<10}{'Parámetros'}")
-for r in results:
-    print(f"{r['Modelo']:<25}{r['Accuracy']:<10}{r['Tiempo(s)']:<10}{r['Parámetros']}")
+model = build_model(InceptionV3, input_shape=(img_size, img_size, 3), num_classes=num_classes)
+
+history = model.fit(
+    X_train_resized, y_train_cat,
+    validation_data=(X_test_resized, y_test_cat),
+    epochs=10,
+    batch_size=32
+)
+
+
